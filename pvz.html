@@ -1,0 +1,1284 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>植物大战僵尸</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; display: flex; justify-content: center; align-items: center; min-height: 100vh; }
+    canvas { display: block; border: 3px solid #4a7c59; box-shadow: 0 0 40px rgba(74,124,89,0.6); }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="900" height="600"></canvas>
+<script>
+'use strict';
+
+// ================================================================
+// 全局常量
+// ================================================================
+const CANVAS_W   = 900;
+const CANVAS_H   = 600;
+const GRID_COLS  = 9;
+const GRID_ROWS  = 5;
+const CELL_W     = 80;
+const CELL_H     = 100;
+const CARD_BAR_W = 120;
+const HUD_H      = 50;
+const GRID_X     = CARD_BAR_W;  // 120
+const GRID_Y     = HUD_H;       // 50
+
+// ================================================================
+// GameState 枚举
+// ================================================================
+const GameState = Object.freeze({
+  MENU: 'MENU', PLAYING: 'PLAYING', PAUSED: 'PAUSED', WIN: 'WIN', LOSE: 'LOSE',
+});
+
+// ================================================================
+// SoundManager — Web Audio API 合成音效，无需音频文件
+// ================================================================
+class SoundManager {
+  constructor() {
+    try {
+      this.actx = new (window.AudioContext || window.webkitAudioContext)();
+      this.master = this.actx.createGain();
+      this.master.gain.value = 0.35;
+      this.master.connect(this.actx.destination);
+    } catch (e) { this.actx = null; }
+    this.muted = false;
+  }
+
+  _resume() { if (this.actx && this.actx.state === 'suspended') this.actx.resume(); }
+
+  _play(setup) {
+    if (!this.actx || this.muted) return;
+    this._resume();
+    setup(this.actx, this.master);
+  }
+
+  // 收集阳光：短促上升正弦波 440→880Hz
+  playSunCollect() {
+    this._play((ctx, out) => {
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.connect(g); g.connect(out);
+      osc.type = 'sine';
+      const t = ctx.currentTime;
+      osc.frequency.setValueAtTime(440, t);
+      osc.frequency.linearRampToValueAtTime(880, t + 0.12);
+      g.gain.setValueAtTime(0.3, t);
+      g.gain.linearRampToValueAtTime(0, t + 0.15);
+      osc.start(t); osc.stop(t + 0.15);
+    });
+  }
+
+  // 种植：低沉三角波 咚声
+  playPlant() {
+    this._play((ctx, out) => {
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.connect(g); g.connect(out);
+      osc.type = 'triangle';
+      const t = ctx.currentTime;
+      osc.frequency.setValueAtTime(220, t);
+      osc.frequency.linearRampToValueAtTime(100, t + 0.18);
+      g.gain.setValueAtTime(0.4, t);
+      g.gain.linearRampToValueAtTime(0, t + 0.2);
+      osc.start(t); osc.stop(t + 0.2);
+    });
+  }
+
+  toggleMute() { this.muted = !this.muted; }
+}
+
+// ================================================================
+// ParticleSystem — 通用粒子特效
+// ================================================================
+class Particle {
+  constructor(x, y, vx, vy, color, life, size) {
+    Object.assign(this, { x, y, vx, vy, color, life, maxLife: life, size, dead: false });
+  }
+  update(dt) {
+    this.x  += this.vx * dt;
+    this.y  += this.vy * dt;
+    this.vy += 130 * dt; // 重力
+    this.life -= dt;
+    if (this.life <= 0) this.dead = true;
+  }
+  draw(ctx) {
+    const a = Math.max(0, this.life / this.maxLife);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size * a + 0.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+class ParticleSystem {
+  constructor() { this.list = []; }
+
+  burst(x, y, count, color, speed = 80, life = 0.5, size = 4) {
+    for (let i = 0; i < count; i++) {
+      const a = Math.random() * Math.PI * 2;
+      const s = speed * (0.4 + Math.random() * 0.6);
+      this.list.push(new Particle(x, y, Math.cos(a)*s, Math.sin(a)*s, color, life*(0.6+Math.random()*0.4), size*(0.5+Math.random())));
+    }
+  }
+
+  update(dt) {
+    for (const p of this.list) p.update(dt);
+    this.list = this.list.filter(p => !p.dead);
+  }
+  draw(ctx) { for (const p of this.list) p.draw(ctx); }
+}
+
+// ================================================================
+// Sun 类 — 单个阳光实例
+// ================================================================
+class Sun {
+  constructor(x, startY, targetY, fromPlant = false) {
+    this.x = x; this.y = startY; this.targetY = targetY;
+    this.radius = 15; this.value = 25;
+    this.angle = 0;           // 旋转角（光芒动画）
+    this.idleTime = 0;        // 停留时间
+    this.maxIdle  = 8;        // 8秒后消失
+    this.dead = false; this.collected = false;
+    this.state = fromPlant ? 'idle' : 'falling';
+    this.fallSpeed = 45;      // px/s
+    this.hovered = false;
+    this.scale = 1;
+    // 贝塞尔飞行动画参数
+    this.flyProgress = 0;
+    this.flyDuration = 0.38;
+    this.flyStartX = x; this.flyStartY = targetY;
+    this.flyEndX = 28; this.flyEndY = 30; // 阳光计数器坐标
+  }
+
+  update(dt) {
+    this.angle += dt * 1.8;
+    if (this.state === 'falling') {
+      this.y += this.fallSpeed * dt;
+      if (this.y >= this.targetY) { this.y = this.targetY; this.state = 'idle'; }
+    } else if (this.state === 'idle') {
+      this.idleTime += dt;
+      if (this.idleTime >= this.maxIdle) this.dead = true;
+      this.scale += (( this.hovered ? 1.25 : 1.0) - this.scale) * Math.min(dt * 12, 1);
+    } else if (this.state === 'flying') {
+      this.flyProgress += dt / this.flyDuration;
+      if (this.flyProgress >= 1) { this.flyProgress = 1; this.dead = true; this.collected = true; }
+      // 二次贝塞尔曲线
+      const t  = this.flyProgress;
+      const cx = (this.flyStartX + this.flyEndX) / 2 - 50;
+      const cy = Math.min(this.flyStartY, this.flyEndY) - 90;
+      this.x = (1-t)*(1-t)*this.flyStartX + 2*(1-t)*t*cx + t*t*this.flyEndX;
+      this.y = (1-t)*(1-t)*this.flyStartY + 2*(1-t)*t*cy + t*t*this.flyEndY;
+    }
+  }
+
+  isClicked(mx, my) {
+    if (this.state !== 'idle') return false;
+    const dx = mx - this.x, dy = my - this.y;
+    return dx*dx + dy*dy <= (this.radius * 1.5) ** 2;
+  }
+
+  collect() {
+    if (this.state !== 'idle') return;
+    this.flyStartX = this.x; this.flyStartY = this.y;
+    this.state = 'flying'; this.flyProgress = 0;
+  }
+
+  draw(ctx) {
+    if (this.dead) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.scale(this.scale, this.scale);
+
+    // 旋转光芒
+    const rayAlpha = this.state === 'flying' ? 0.5 : 0.85;
+    ctx.strokeStyle = `rgba(255,220,50,${rayAlpha})`;
+    ctx.lineWidth = 2;
+    for (let i = 0; i < 8; i++) {
+      const a = this.angle + (i / 8) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(Math.cos(a)*(this.radius+2), Math.sin(a)*(this.radius+2));
+      ctx.lineTo(Math.cos(a)*(this.radius+7), Math.sin(a)*(this.radius+7));
+      ctx.stroke();
+    }
+
+    // 圆形主体（径向渐变）
+    const g = ctx.createRadialGradient(-4, -4, 2, 0, 0, this.radius);
+    g.addColorStop(0, '#ffffa0'); g.addColorStop(0.5, '#ffd700'); g.addColorStop(1, '#e0a000');
+    ctx.fillStyle = g;
+    ctx.beginPath(); ctx.arc(0, 0, this.radius, 0, Math.PI * 2); ctx.fill();
+
+    // 笑脸
+    ctx.fillStyle = '#a06000';
+    ctx.beginPath();
+    ctx.arc(-4, -2, 2, 0, Math.PI * 2);
+    ctx.arc( 4, -2, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#a06000'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(0, 1, 4, 0.2, Math.PI - 0.2); ctx.stroke();
+    ctx.restore();
+
+    // 快消失时闪烁
+    if (this.state === 'idle' && this.idleTime > 6 && Math.sin(this.idleTime * 12) < 0) {
+      ctx.save(); ctx.globalAlpha = 0.4; ctx.fillStyle = '#ffffff';
+      ctx.beginPath(); ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2); ctx.fill();
+      ctx.restore();
+    }
+  }
+}
+
+// ================================================================
+// SunManager — 管理所有阳光实例的生成与收集
+// ================================================================
+class SunManager {
+  constructor(game) {
+    this.game = game;
+    this.suns = [];
+    this.timer = 0;
+    this.interval = 5 + Math.random() * 3; // 5-8s 掉落一次
+  }
+
+  spawnFromSky() {
+    const x = GRID_X + 30 + Math.random() * (GRID_COLS * CELL_W - 60);
+    const ty = GRID_Y + 20 + Math.random() * (GRID_ROWS * CELL_H - 60);
+    this.suns.push(new Sun(x, -20, ty, false));
+    this.interval = 5 + Math.random() * 3;
+  }
+
+  // 向日葵产出的阳光（在植物上方弹出）
+  spawnFromPlant(px, py) {
+    const offsetX = (Math.random() - 0.5) * 24;
+    this.suns.push(new Sun(px + offsetX, py - 20, py - 35, true));
+  }
+
+  updateHover(mx, my) {
+    for (const s of this.suns) {
+      if (s.state !== 'idle') { s.hovered = false; continue; }
+      const dx = mx - s.x, dy = my - s.y;
+      s.hovered = (dx*dx + dy*dy <= (s.radius * 1.8) ** 2);
+    }
+  }
+
+  // 点击检测，返回 true 表示命中
+  tryClick(mx, my) {
+    for (let i = this.suns.length - 1; i >= 0; i--) {
+      if (this.suns[i].isClicked(mx, my)) {
+        this.suns[i].collect();
+        this.game.sound.playSunCollect();
+        this.game.particles.burst(this.suns[i].flyStartX, this.suns[i].flyStartY, 8, '#ffd700', 65, 0.45, 3);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  update(dt) {
+    this.timer += dt;
+    if (this.timer >= this.interval) { this.timer = 0; this.spawnFromSky(); }
+    for (const s of this.suns) s.update(dt);
+    // 飞行完成 → 加阳光
+    for (const s of this.suns) {
+      if (s.collected) { this.game.sun += s.value; s.collected = false; }
+    }
+    this.suns = this.suns.filter(s => !s.dead);
+  }
+
+  draw(ctx) { for (const s of this.suns) s.draw(ctx); }
+}
+
+// ================================================================
+// Plant 基类
+// ================================================================
+class Plant {
+  constructor(col, row, type, health) {
+    this.col = col; this.row = row; this.type = type;
+    this.health = health; this.maxHealth = health;
+    this.x = GRID_X + col * CELL_W + CELL_W / 2;
+    this.y = GRID_Y + row * CELL_H + CELL_H / 2;
+    this.age = 0;
+    this.dead = false; this.dying = false; this.dyingTimer = 0;
+    this.hitFlash = 0; // 受伤白闪持续时间
+  }
+
+  takeDamage(amount) {
+    this.health = Math.max(0, this.health - amount);
+    this.hitFlash = 0.12;
+    if (this.health <= 0) this.dying = true;
+  }
+
+  update(dt) {
+    this.age += dt;
+    if (this.hitFlash > 0) this.hitFlash -= dt;
+    if (this.dying) {
+      this.dyingTimer += dt;
+      if (this.dyingTimer >= 0.55) this.dead = true;
+    }
+  }
+
+  // 死亡时缩小变淡变灰；返回 true 表示需要 ctx.restore()
+  _beginDying(ctx) {
+    if (!this.dying) return false;
+    const p = Math.min(this.dyingTimer / 0.55, 1);
+    ctx.save();
+    ctx.globalAlpha = 1 - p;
+    ctx.translate(this.x, this.y);
+    ctx.scale(1 - p * 0.7, 1 - p * 0.7);
+    ctx.translate(-this.x, -this.y);
+    return true;
+  }
+
+  // 血量条（仅在受伤后显示）
+  _drawHP(ctx) {
+    if (this.health >= this.maxHealth) return;
+    const bw = 50, bh = 5;
+    const bx = this.x - bw / 2, by = this.y - CELL_H / 2 - 10;
+    ctx.fillStyle = '#222'; ctx.fillRect(bx, by, bw, bh);
+    const r = this.health / this.maxHealth;
+    ctx.fillStyle = r > 0.5 ? '#44cc44' : r > 0.25 ? '#cccc44' : '#cc4444';
+    ctx.fillRect(bx, by, bw * r, bh);
+  }
+
+  draw(ctx) {}
+}
+
+// ================================================================
+// Sunflower — 每 20s 产出一个阳光
+// ================================================================
+class Sunflower extends Plant {
+  constructor(col, row) {
+    super(col, row, 'sunflower', 300);
+    this.sunTimer = 0; this.sunInterval = 20;
+    this.bounceTimer = 0; // 产出弹跳动画
+  }
+
+  update(dt) {
+    super.update(dt);
+    if (this.dying || this.dead) return false;
+    if (this.bounceTimer > 0) this.bounceTimer -= dt;
+    this.sunTimer += dt;
+    if (this.sunTimer >= this.sunInterval) {
+      this.sunTimer = 0; this.bounceTimer = 0.5;
+      return true; // 通知 PlantManager 产出阳光
+    }
+    return false;
+  }
+
+  draw(ctx) {
+    const hasDying = this._beginDying(ctx);
+    const t = this.age;
+    const sway = Math.sin(t * 1.2) * 0.055;
+    const bounceY = this.bounceTimer > 0 ? -Math.abs(Math.sin((this.bounceTimer / 0.5) * Math.PI)) * 9 : 0;
+
+    ctx.save();
+    // 以茎根为支点摇摆
+    ctx.translate(this.x, this.y + 32); ctx.rotate(sway); ctx.translate(-this.x, -(this.y + 32));
+
+    // 茎
+    ctx.strokeStyle = this.hitFlash > 0 ? '#ffffff' : '#4a8a20';
+    ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(this.x, this.y + 32); ctx.lineTo(this.x, this.y - 8 + bounceY); ctx.stroke();
+
+    // 小叶子
+    ctx.fillStyle = '#3a7a10';
+    ctx.save(); ctx.translate(this.x - 10, this.y + 10); ctx.rotate(-0.45);
+    ctx.beginPath(); ctx.ellipse(0, 0, 11, 5, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+
+    // 花瓣 8 片（椭圆，随时间缓慢旋转）
+    ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : '#ffd700';
+    for (let i = 0; i < 8; i++) {
+      const a  = (i / 8) * Math.PI * 2 + t * 0.28;
+      const px = this.x + Math.cos(a) * 19;
+      const py = this.y - 8 + bounceY + Math.sin(a) * 19;
+      ctx.save(); ctx.translate(px, py); ctx.rotate(a);
+      ctx.beginPath(); ctx.ellipse(0, 0, 6, 12, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+    }
+
+    // 花盘
+    ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : '#7a3c10';
+    ctx.beginPath(); ctx.arc(this.x, this.y - 8 + bounceY, 14, 0, Math.PI * 2); ctx.fill();
+
+    // 眼睛
+    ctx.fillStyle = '#2d1500';
+    ctx.beginPath();
+    ctx.arc(this.x - 4, this.y - 11 + bounceY, 2, 0, Math.PI * 2);
+    ctx.arc(this.x + 4, this.y - 11 + bounceY, 2, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 微笑
+    ctx.strokeStyle = '#2d1500'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(this.x, this.y - 7 + bounceY, 4, 0.25, Math.PI - 0.25); ctx.stroke();
+
+    ctx.restore();
+    this._drawHP(ctx);
+    if (hasDying) ctx.restore();
+  }
+}
+
+// ================================================================
+// Peashooter — 豌豆射手（行为在 Phase 3 实现）
+// ================================================================
+class Peashooter extends Plant {
+  constructor(col, row) {
+    super(col, row, 'peashooter', 300);
+    this.shootTimer = 0;
+  }
+
+  update(dt) { super.update(dt); return false; }
+
+  draw(ctx) {
+    const hasDying = this._beginDying(ctx);
+    const sway = Math.sin(this.age * 1.0) * 0.03;
+    ctx.save();
+    ctx.translate(this.x, this.y + 32); ctx.rotate(sway); ctx.translate(-this.x, -(this.y + 32));
+
+    // 茎
+    ctx.strokeStyle = '#3a8a10'; ctx.lineWidth = 5; ctx.lineCap = 'round';
+    ctx.beginPath(); ctx.moveTo(this.x, this.y + 32); ctx.lineTo(this.x, this.y); ctx.stroke();
+
+    // 叶子
+    ctx.fillStyle = '#2a6a08';
+    ctx.save(); ctx.translate(this.x + 10, this.y + 10); ctx.rotate(0.5);
+    ctx.beginPath(); ctx.ellipse(0, 0, 13, 5, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
+
+    // 头部
+    ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : '#5aaa20';
+    ctx.beginPath(); ctx.arc(this.x, this.y - 7, 20, 0, Math.PI * 2); ctx.fill();
+
+    // 眼睛
+    ctx.fillStyle = '#1a4a00';
+    ctx.beginPath(); ctx.arc(this.x - 6, this.y - 12, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(this.x - 5, this.y - 13, 1.5, 0, Math.PI * 2); ctx.fill();
+
+    // 炮管
+    ctx.fillStyle = '#2a6a08';
+    ctx.beginPath(); ctx.roundRect(this.x + 9, this.y - 11, 22, 9, 3); ctx.fill();
+    ctx.fillStyle = '#1a4a00';
+    ctx.beginPath(); ctx.arc(this.x + 31, this.y - 6, 4.5, 0, Math.PI * 2); ctx.fill();
+
+    ctx.restore();
+    this._drawHP(ctx);
+    if (hasDying) ctx.restore();
+  }
+}
+
+// ================================================================
+// WallNut — 坚果墙（3段受损外观）
+// ================================================================
+class WallNut extends Plant {
+  constructor(col, row) { super(col, row, 'wallnut', 4000); }
+
+  update(dt) { super.update(dt); return false; }
+
+  draw(ctx) {
+    const hasDying = this._beginDying(ctx);
+    const ratio = this.health / this.maxHealth;
+    const shakeX = this.hitFlash > 0 ? (Math.random() - 0.5) * 4 : 0;
+
+    ctx.save(); ctx.translate(shakeX, 0);
+
+    // 椭圆主体，颜色随受伤变暗
+    const color = this.hitFlash > 0 ? '#ffffff'
+                : ratio > 0.66 ? '#c8843a'
+                : ratio > 0.33 ? '#a06428' : '#784818';
+    ctx.fillStyle = color;
+    ctx.beginPath(); ctx.ellipse(this.x, this.y, 28, 35, 0, 0, Math.PI * 2); ctx.fill();
+
+    // 裂纹（第2段）
+    if (ratio <= 0.66 && this.hitFlash === 0) {
+      ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.moveTo(this.x - 8, this.y - 20);
+      ctx.lineTo(this.x - 4, this.y - 6); ctx.lineTo(this.x - 11, this.y + 6); ctx.stroke();
+    }
+    // 更多裂纹（第3段）
+    if (ratio <= 0.33 && this.hitFlash === 0) {
+      ctx.beginPath(); ctx.moveTo(this.x + 6, this.y - 16);
+      ctx.lineTo(this.x + 11, this.y - 1); ctx.lineTo(this.x + 4, this.y + 13); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(this.x - 2, this.y + 10);
+      ctx.lineTo(this.x + 8, this.y + 22); ctx.stroke();
+    }
+
+    // 眼睛
+    const eyeY = this.y + (ratio > 0.33 ? -5 : -2);
+    ctx.fillStyle = '#2a1500';
+    ctx.beginPath(); ctx.arc(this.x - 9, eyeY, 3.5, 0, Math.PI * 2);
+    ctx.arc(this.x + 9, eyeY, 3.5, 0, Math.PI * 2); ctx.fill();
+
+    // 嘴（健康=微笑，受伤=皱眉）
+    ctx.strokeStyle = '#2a1500'; ctx.lineWidth = 2.2;
+    ctx.beginPath();
+    if (ratio > 0.33) ctx.arc(this.x, this.y + 8, 6, 0.3, Math.PI - 0.3);
+    else ctx.arc(this.x, this.y + 16, 6, Math.PI + 0.3, -0.3);
+    ctx.stroke();
+
+    ctx.restore();
+    this._drawHP(ctx);
+    if (hasDying) ctx.restore();
+  }
+}
+
+// ================================================================
+// CherryBomb — 樱桃炸弹（爆炸 AoE 在 Phase 4 实现）
+// ================================================================
+class CherryBomb extends Plant {
+  constructor(col, row) {
+    super(col, row, 'cherrybomb', 300);
+    this.fuseTimer = 0; this.fuseMax = 1.5;
+    this.exploded = false;
+  }
+
+  update(dt) {
+    super.update(dt);
+    if (!this.exploded) {
+      this.fuseTimer += dt;
+      if (this.fuseTimer >= this.fuseMax) {
+        this.exploded = true;
+        this.dying = true; // Phase 4 将在这里触发爆炸 AoE
+      }
+    }
+    return false;
+  }
+
+  draw(ctx) {
+    const hasDying = this._beginDying(ctx);
+    const pulse = 1 + Math.sin(this.age * 9) * 0.07;
+    ctx.save();
+    ctx.translate(this.x, this.y); ctx.scale(pulse, pulse); ctx.translate(-this.x, -this.y);
+
+    // 左樱桃
+    ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : '#cc2020';
+    ctx.beginPath(); ctx.arc(this.x - 11, this.y + 5, 14, 0, Math.PI * 2); ctx.fill();
+    // 右樱桃
+    ctx.beginPath(); ctx.arc(this.x + 11, this.y + 5, 14, 0, Math.PI * 2); ctx.fill();
+
+    // 连接茎
+    ctx.strokeStyle = '#3a6010'; ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(this.x - 11, this.y - 9);
+    ctx.quadraticCurveTo(this.x, this.y - 24, this.x + 11, this.y - 9);
+    ctx.stroke();
+
+    // 引信（随时间缩短）
+    const fuseRatio = Math.min(this.fuseTimer / this.fuseMax, 1);
+    ctx.strokeStyle = fuseRatio > 0.6 ? '#ff4444' : '#aaaa00';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(this.x, this.y - 24);
+    ctx.lineTo(this.x + 3, this.y - 34 + fuseRatio * 10);
+    ctx.stroke();
+
+    // 左眼睛
+    ctx.fillStyle = '#2a0000';
+    ctx.beginPath();
+    ctx.arc(this.x - 14, this.y + 2, 2.5, 0, Math.PI * 2);
+    ctx.arc(this.x - 8,  this.y + 2, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#2a0000'; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(this.x - 11, this.y + 6, 3, 0.3, Math.PI - 0.3); ctx.stroke();
+
+    ctx.restore();
+    if (hasDying) ctx.restore();
+  }
+}
+
+// ================================================================
+// PlantFactory — 工厂模式，统一创建植物
+// ================================================================
+class PlantFactory {
+  static create(type, col, row) {
+    switch (type) {
+      case 'sunflower':  return new Sunflower(col, row);
+      case 'peashooter': return new Peashooter(col, row);
+      case 'wallnut':    return new WallNut(col, row);
+      case 'cherrybomb': return new CherryBomb(col, row);
+      default: return null;
+    }
+  }
+}
+
+// ================================================================
+// PlantManager — 管理所有已种植的植物
+// ================================================================
+class PlantManager {
+  constructor(game) {
+    this.game = game;
+    this.plants = [];
+    this.cellMap = {}; // "col,row" → Plant
+  }
+
+  place(type, col, row) {
+    const key = `${col},${row}`;
+    if (this.cellMap[key]) return false;
+    const p = PlantFactory.create(type, col, row);
+    if (!p) return false;
+    this.plants.push(p);
+    this.cellMap[key] = p;
+    return true;
+  }
+
+  getAt(col, row) { return this.cellMap[`${col},${row}`] || null; }
+
+  remove(col, row) {
+    const key = `${col},${row}`;
+    if (!this.cellMap[key]) return;
+    this.cellMap[key].dead = true;
+    delete this.cellMap[key];
+  }
+
+  update(dt) {
+    for (const p of this.plants) {
+      const emitSun = p.update(dt);
+      if (emitSun === true && p.type === 'sunflower' && !p.dead) {
+        this.game.sunManager.spawnFromPlant(p.x, p.y);
+      }
+    }
+    // 清理死亡植物，同时更新 cellMap
+    for (const p of this.plants) {
+      if (p.dead) {
+        const key = `${p.col},${p.row}`;
+        if (this.cellMap[key] === p) delete this.cellMap[key];
+      }
+    }
+    this.plants = this.plants.filter(p => !p.dead);
+  }
+
+  draw(ctx) {
+    // 按行号升序绘制，前排遮后排
+    const sorted = [...this.plants].sort((a, b) => a.row - b.row);
+    for (const p of sorted) p.draw(ctx);
+  }
+}
+
+// ================================================================
+// SeedPacket — 单张种子卡牌的数据与状态
+// ================================================================
+class SeedPacket {
+  constructor(type, name, cost, cooldownMax) {
+    this.type = type; this.name = name; this.cost = cost;
+    this.cooldownMax = cooldownMax;
+    this.cooldown = 0;
+    this.selected = false;
+  }
+  get isReady()         { return this.cooldown <= 0; }
+  canAfford(sun)        { return sun >= this.cost && this.isReady; }
+  startCooldown()       { this.cooldown = this.cooldownMax; }
+  update(dt)            { if (this.cooldown > 0) this.cooldown = Math.max(0, this.cooldown - dt); }
+}
+
+// ================================================================
+// Grid — 网格坐标系
+// ================================================================
+class Grid {
+  constructor() {
+    this.colorLight = '#5a8f3c';
+    this.colorDark  = '#4a7a2e';
+    this.hoverCell  = null;
+  }
+
+  toPixel(col, row)       { return { x: GRID_X + col*CELL_W,           y: GRID_Y + row*CELL_H }; }
+  toCenterPixel(col, row) { return { x: GRID_X + col*CELL_W + CELL_W/2, y: GRID_Y + row*CELL_H + CELL_H/2 }; }
+
+  toCell(px, py) {
+    const col = Math.floor((px - GRID_X) / CELL_W);
+    const row = Math.floor((py - GRID_Y) / CELL_H);
+    return (col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS) ? { col, row } : null;
+  }
+
+  updateHover(mx, my) { this.hoverCell = this.toCell(mx, my); }
+
+  // plantMode: 是否高亮格子（种植模式）
+  draw(ctx, plantMode = false, plantManager = null) {
+    for (let row = 0; row < GRID_ROWS; row++) {
+      for (let col = 0; col < GRID_COLS; col++) {
+        const { x, y } = this.toPixel(col, row);
+        ctx.fillStyle = (row + col) % 2 === 0 ? this.colorLight : this.colorDark;
+        ctx.fillRect(x, y, CELL_W, CELL_H);
+
+        if (plantMode && this.hoverCell && this.hoverCell.col === col && this.hoverCell.row === row) {
+          const occupied = plantManager && plantManager.getAt(col, row);
+          ctx.fillStyle = occupied ? 'rgba(255,60,60,0.35)' : 'rgba(80,255,80,0.32)';
+          ctx.fillRect(x, y, CELL_W, CELL_H);
+        }
+      }
+    }
+
+    // 细网格线
+    ctx.strokeStyle = 'rgba(0,0,0,0.12)'; ctx.lineWidth = 0.5;
+    for (let r = 0; r <= GRID_ROWS; r++) {
+      ctx.beginPath();
+      ctx.moveTo(GRID_X, GRID_Y + r*CELL_H);
+      ctx.lineTo(GRID_X + GRID_COLS*CELL_W, GRID_Y + r*CELL_H); ctx.stroke();
+    }
+    for (let c = 0; c <= GRID_COLS; c++) {
+      ctx.beginPath();
+      ctx.moveTo(GRID_X + c*CELL_W, GRID_Y);
+      ctx.lineTo(GRID_X + c*CELL_W, GRID_Y + GRID_ROWS*CELL_H); ctx.stroke();
+    }
+  }
+}
+
+// ================================================================
+// Game — 全局状态 + 游戏循环
+// ================================================================
+class Game {
+  constructor() {
+    this.canvas = document.getElementById('gameCanvas');
+    this.ctx    = this.canvas.getContext('2d');
+    this.state  = GameState.MENU;
+    this.grid   = new Grid();
+    this.sound  = new SoundManager();
+
+    this.lastTimestamp = 0; this.deltaTime = 0; this.gameTime = 0;
+    this.fps = 0; this._fpsFrames = 0; this._fpsAccum = 0;
+    this.showFPS = true;
+
+    this.mouse = { x: 0, y: 0 };
+    this.menuTimer = 0;
+
+    // 游戏子系统（_startGame 时初始化）
+    this.sun          = 50;
+    this.sunManager   = null;
+    this.plantManager = null;
+    this.particles    = null;
+    this.seedPackets  = [];
+    this.selectedCard = -1; // 当前选中的卡牌索引，-1=无
+
+    this.ui = {
+      startBtn: { x: 325, y: 310, w: 250, h: 65 },
+      pauseBtn: { x: 816, y: 8,   w: 76,  h: 34 },
+    };
+
+    this._bindEvents();
+  }
+
+  // 卡牌槽位矩形：4张，从 y=62 开始，每张高 90px，间距 5px
+  _cardRect(i) { return { x: 8, y: 62 + i * 95, w: 104, h: 90 }; }
+
+  // ── 事件绑定 ────────────────────────────────────────────────
+  _bindEvents() {
+    const cv = this.canvas;
+
+    cv.addEventListener('mousemove', (e) => {
+      const r = cv.getBoundingClientRect();
+      this.mouse.x = (e.clientX - r.left) * (CANVAS_W / r.width);
+      this.mouse.y = (e.clientY - r.top)  * (CANVAS_H / r.height);
+      this.grid.updateHover(this.mouse.x, this.mouse.y);
+      if (this.sunManager) this.sunManager.updateHover(this.mouse.x, this.mouse.y);
+    });
+
+    cv.addEventListener('click', (e) => {
+      const r = cv.getBoundingClientRect();
+      this._handleClick(
+        (e.clientX - r.left) * (CANVAS_W / r.width),
+        (e.clientY - r.top)  * (CANVAS_H / r.height)
+      );
+    });
+
+    // 右键取消种植
+    cv.addEventListener('contextmenu', (e) => { e.preventDefault(); this.selectedCard = -1; });
+
+    document.addEventListener('keydown', (e) => this._handleKey(e.key));
+  }
+
+  // ── 点击分发 ────────────────────────────────────────────────
+  _handleClick(mx, my) {
+    const hit = b => mx >= b.x && mx <= b.x+b.w && my >= b.y && my <= b.y+b.h;
+
+    if (this.state === GameState.MENU)   { if (hit(this.ui.startBtn)) this._startGame(); return; }
+    if (this.state === GameState.PAUSED) { if (hit(this.ui.pauseBtn)) this._resume();    return; }
+    if (this.state !== GameState.PLAYING) return;
+
+    if (hit(this.ui.pauseBtn)) { this._pause(); return; }
+
+    // 1) 先检测阳光点击
+    if (this.sunManager && this.sunManager.tryClick(mx, my)) return;
+
+    // 2) 有选中卡牌 → 检测网格放置
+    if (this.selectedCard >= 0) {
+      const cell = this.grid.toCell(mx, my);
+      if (cell) { this._tryPlant(cell.col, cell.row); }
+      else       { this.selectedCard = -1; }
+      return;
+    }
+
+    // 3) 点击卡牌选中
+    for (let i = 0; i < this.seedPackets.length; i++) {
+      const r = this._cardRect(i);
+      if (mx >= r.x && mx <= r.x+r.w && my >= r.y && my <= r.y+r.h) {
+        if (this.seedPackets[i].canAfford(this.sun))
+          this.selectedCard = (this.selectedCard === i) ? -1 : i;
+        return;
+      }
+    }
+  }
+
+  _tryPlant(col, row) {
+    const pkt = this.seedPackets[this.selectedCard];
+    if (!pkt || !pkt.canAfford(this.sun)) { this.selectedCard = -1; return; }
+    if (this.plantManager.getAt(col, row)) return; // 已有植物
+
+    if (this.plantManager.place(pkt.type, col, row)) {
+      this.sun -= pkt.cost;
+      pkt.startCooldown();
+      this.sound.playPlant();
+      const c = this.grid.toCenterPixel(col, row);
+      this.particles.burst(c.x, c.y, 14, '#88ff44', 75, 0.45, 3);
+      this.selectedCard = -1;
+    }
+  }
+
+  // ── 键盘分发 ────────────────────────────────────────────────
+  _handleKey(key) {
+    if (key === 'Enter' && this.state === GameState.MENU) { this._startGame(); return; }
+    if (key === 'p' || key === 'P') {
+      if      (this.state === GameState.PLAYING) this._pause();
+      else if (this.state === GameState.PAUSED)  this._resume();
+    }
+    if (key === 'f' || key === 'F') this.showFPS = !this.showFPS;
+    if (key === 'Escape')           this.selectedCard = -1;
+    if (key === 'm' || key === 'M') this.sound.toggleMute();
+    if ((key === 'r' || key === 'R') && (this.state === GameState.WIN || this.state === GameState.LOSE))
+      this._startGame();
+  }
+
+  // ── 状态切换 ────────────────────────────────────────────────
+  _startGame() {
+    this.state = GameState.PLAYING; this.gameTime = 0;
+    this.sun = 50; this.selectedCard = -1;
+    this.particles    = new ParticleSystem();
+    this.sunManager   = new SunManager(this);
+    this.plantManager = new PlantManager(this);
+    this.seedPackets  = [
+      new SeedPacket('sunflower',  '向日葵',   50,  7.5),
+      new SeedPacket('peashooter', '豌豆射手', 100, 7.5),
+      new SeedPacket('wallnut',    '坚果墙',    50,  30),
+      new SeedPacket('cherrybomb', '樱桃炸弹', 150, 50),
+    ];
+  }
+
+  _pause()  { if (this.state === GameState.PLAYING) this.state = GameState.PAUSED; }
+  _resume() { if (this.state === GameState.PAUSED)  this.state = GameState.PLAYING; }
+
+  // ── 主循环 ──────────────────────────────────────────────────
+  start() { requestAnimationFrame(t => this._loop(t)); }
+
+  _loop(timestamp) {
+    this.deltaTime     = Math.min((timestamp - this.lastTimestamp) / 1000, 0.1);
+    this.lastTimestamp = timestamp;
+    this._fpsFrames++;
+    this._fpsAccum += this.deltaTime;
+    if (this._fpsAccum >= 1) { this.fps = this._fpsFrames; this._fpsFrames = 0; this._fpsAccum -= 1; }
+    this._update(this.deltaTime);
+    this._draw();
+    requestAnimationFrame(t => this._loop(t));
+  }
+
+  // ── 更新逻辑 ────────────────────────────────────────────────
+  _update(dt) {
+    this.menuTimer += dt;
+    if (this.state !== GameState.PLAYING) return;
+    this.gameTime += dt;
+    for (const pkt of this.seedPackets) pkt.update(dt);
+    this.sunManager.update(dt);
+    this.plantManager.update(dt);
+    this.particles.update(dt);
+  }
+
+  // ── 总绘制 ──────────────────────────────────────────────────
+  _draw() {
+    const ctx = this.ctx;
+    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+    switch (this.state) {
+      case GameState.MENU:    this._drawMenu(); break;
+      case GameState.PLAYING: this._drawGameScene(); break;
+      case GameState.PAUSED:  this._drawGameScene(); this._drawPauseOverlay(); break;
+      case GameState.WIN:     this._drawGameScene(); this._drawWinScreen();   break;
+      case GameState.LOSE:    this._drawGameScene(); this._drawLoseScreen();  break;
+    }
+    if (this.showFPS && this.state !== GameState.MENU) this._drawFPS();
+    this._updateCursor();
+  }
+
+  // ── 游戏主场景 ──────────────────────────────────────────────
+  _drawGameScene() {
+    const ctx = this.ctx;
+    const plantMode = this.selectedCard >= 0;
+
+    // 背景
+    ctx.fillStyle = '#7ec8e3';
+    ctx.fillRect(GRID_X, 0, CANVAS_W - GRID_X, GRID_Y);
+    ctx.fillRect(GRID_X + GRID_COLS*CELL_W, GRID_Y, CANVAS_W - GRID_X - GRID_COLS*CELL_W, GRID_ROWS*CELL_H);
+    ctx.fillStyle = '#4a7a2e';
+    ctx.fillRect(GRID_X, GRID_Y + GRID_ROWS*CELL_H, CANVAS_W - GRID_X, CANVAS_H - GRID_Y - GRID_ROWS*CELL_H);
+
+    this.grid.draw(ctx, plantMode, this.plantManager);
+    if (this.plantManager) this.plantManager.draw(ctx);
+    if (this.sunManager)   this.sunManager.draw(ctx);
+    if (this.particles)    this.particles.draw(ctx);
+    if (plantMode)         this._drawPlantPreview(ctx);
+    this._drawCardBar();
+    this._drawHUD();
+  }
+
+  // 鼠标跟随植物预览（半透明）
+  _drawPlantPreview(ctx) {
+    const cell = this.grid.hoverCell;
+    if (!cell) return;
+    const pkt = this.seedPackets[this.selectedCard];
+    const occupied = this.plantManager.getAt(cell.col, cell.row);
+    ctx.save();
+    ctx.globalAlpha = occupied ? 0.25 : 0.55;
+    const preview = PlantFactory.create(pkt.type, cell.col, cell.row);
+    if (preview) preview.draw(ctx);
+    ctx.restore();
+  }
+
+  // ── 左侧种植卡牌栏 ──────────────────────────────────────────
+  _drawCardBar() {
+    const ctx = this.ctx;
+
+    // 背景渐变
+    const grad = ctx.createLinearGradient(0, 0, CARD_BAR_W, 0);
+    grad.addColorStop(0, '#263d17'); grad.addColorStop(1, '#3a5c20');
+    ctx.fillStyle = grad; ctx.fillRect(0, 0, CARD_BAR_W, CANVAS_H);
+
+    // 右边框
+    ctx.strokeStyle = '#1a2e0a'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(CARD_BAR_W, 0); ctx.lineTo(CARD_BAR_W, CANVAS_H); ctx.stroke();
+
+    // 阳光显示框
+    ctx.fillStyle = '#1a2e0a';
+    ctx.beginPath(); ctx.roundRect(8, 8, 104, 44, 6); ctx.fill();
+    ctx.strokeStyle = '#c8a800'; ctx.lineWidth = 1.5; ctx.stroke();
+    this._miniSun(ctx, 27, 30, 12);
+    ctx.fillStyle = '#ffd700'; ctx.font = 'bold 20px Arial'; ctx.textAlign = 'left';
+    ctx.fillText(String(this.sun), 43, 37);
+
+    // 卡牌
+    for (let i = 0; i < this.seedPackets.length; i++) this._drawCard(ctx, i);
+  }
+
+  _drawCard(ctx, i) {
+    const pkt = this.seedPackets[i];
+    const r   = this._cardRect(i);
+    const affordable = pkt.canAfford(this.sun);
+    const selected   = this.selectedCard === i;
+
+    // 背景
+    ctx.fillStyle = selected ? '#5a9a28' : affordable ? '#2a4a18' : '#1c3010';
+    ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 6); ctx.fill();
+    ctx.strokeStyle = selected ? '#c8ff60' : affordable ? '#4a7a28' : '#2a3a18';
+    ctx.lineWidth = selected ? 2.5 : 1.5; ctx.stroke();
+
+    // 植物小图（上半部分 54px，裁剪）
+    ctx.save();
+    ctx.beginPath(); ctx.roundRect(r.x+2, r.y+2, r.w-4, 52, 4); ctx.clip();
+    this._cardIcon(ctx, pkt.type, r.x + r.w/2, r.y + 30);
+    ctx.restore();
+
+    // 分隔线
+    ctx.strokeStyle = 'rgba(0,0,0,0.3)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(r.x+4, r.y+56); ctx.lineTo(r.x+r.w-4, r.y+56); ctx.stroke();
+
+    // 植物名称
+    ctx.fillStyle = affordable ? '#dfffa0' : '#607050';
+    ctx.font = '10px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(pkt.name, r.x + r.w/2, r.y + 67);
+
+    // 阳光消耗
+    this._miniSun(ctx, r.x + 18, r.y + 81, 7);
+    ctx.fillStyle = affordable ? '#ffd700' : '#807040';
+    ctx.font = 'bold 11px Arial'; ctx.textAlign = 'left';
+    ctx.fillText(String(pkt.cost), r.x + 28, r.y + 85);
+
+    // 冷却遮罩（扫描动画）
+    if (!pkt.isReady) {
+      const ratio = pkt.cooldown / pkt.cooldownMax;
+      // 渐变遮罩从上向下缩退
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h * ratio, 6); ctx.fill();
+      // 扇形覆盖
+      ctx.save();
+      ctx.beginPath(); ctx.roundRect(r.x, r.y, r.w, r.h, 6); ctx.clip();
+      ctx.fillStyle = 'rgba(0,0,0,0.25)';
+      ctx.beginPath();
+      ctx.moveTo(r.x + r.w/2, r.y + r.h/2);
+      ctx.arc(r.x + r.w/2, r.y + r.h/2, 80, -Math.PI/2, -Math.PI/2 + ratio * Math.PI * 2);
+      ctx.closePath(); ctx.fill();
+      ctx.restore();
+      // 剩余秒数
+      ctx.fillStyle = '#ffffff'; ctx.font = 'bold 13px Arial'; ctx.textAlign = 'center';
+      ctx.fillText(`${Math.ceil(pkt.cooldown)}s`, r.x + r.w/2, r.y + r.h/2 + 5);
+    }
+
+    // 选中虚线边框
+    if (selected) {
+      ctx.strokeStyle = '#ffff80'; ctx.lineWidth = 2;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath(); ctx.roundRect(r.x+1, r.y+1, r.w-2, r.h-2, 5); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+  }
+
+  // 卡牌小图标（缩放绘制植物简笔画）
+  _cardIcon(ctx, type, cx, cy) {
+    ctx.save();
+    ctx.translate(cx, cy); ctx.scale(0.52, 0.52); ctx.translate(-cx, -cy);
+    switch (type) {
+      case 'sunflower':
+        ctx.fillStyle = '#ffd700';
+        for (let i = 0; i < 8; i++) {
+          const a = (i/8)*Math.PI*2;
+          ctx.save(); ctx.translate(cx+Math.cos(a)*18, cy+Math.sin(a)*18); ctx.rotate(a);
+          ctx.beginPath(); ctx.ellipse(0,0,5,11,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+        }
+        ctx.fillStyle = '#7a3c10';
+        ctx.beginPath(); ctx.arc(cx, cy, 13, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#2d1500';
+        ctx.beginPath(); ctx.arc(cx-4,cy-2,2,0,Math.PI*2); ctx.arc(cx+4,cy-2,2,0,Math.PI*2); ctx.fill();
+        break;
+      case 'peashooter':
+        ctx.fillStyle = '#5aaa20';
+        ctx.beginPath(); ctx.arc(cx, cy, 18, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#1a4a00';
+        ctx.beginPath(); ctx.arc(cx-5, cy-5, 3, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#2a6a08';
+        ctx.beginPath(); ctx.roundRect(cx+8, cy-5, 18, 8, 3); ctx.fill();
+        break;
+      case 'wallnut':
+        ctx.fillStyle = '#c8843a';
+        ctx.beginPath(); ctx.ellipse(cx, cy, 22, 27, 0, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = '#2a1500';
+        ctx.beginPath(); ctx.arc(cx-8,cy-3,3,0,Math.PI*2); ctx.arc(cx+8,cy-3,3,0,Math.PI*2); ctx.fill();
+        break;
+      case 'cherrybomb':
+        ctx.fillStyle = '#cc2020';
+        ctx.beginPath(); ctx.arc(cx-10, cy+4, 12, 0, Math.PI*2); ctx.fill();
+        ctx.beginPath(); ctx.arc(cx+10, cy+4, 12, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = '#3a6010'; ctx.lineWidth = 2;
+        ctx.beginPath(); ctx.moveTo(cx-10, cy-8); ctx.quadraticCurveTo(cx, cy-20, cx+10, cy-8); ctx.stroke();
+        break;
+    }
+    ctx.restore();
+  }
+
+  // 小太阳图标（HUD 和卡牌共用）
+  _miniSun(ctx, cx, cy, r) {
+    ctx.save();
+    ctx.strokeStyle = '#ffd700'; ctx.lineWidth = 1.5;
+    for (let i = 0; i < 8; i++) {
+      const a = (i/8)*Math.PI*2;
+      ctx.beginPath();
+      ctx.moveTo(cx+Math.cos(a)*(r+1), cy+Math.sin(a)*(r+1));
+      ctx.lineTo(cx+Math.cos(a)*(r+4), cy+Math.sin(a)*(r+4)); ctx.stroke();
+    }
+    ctx.fillStyle = '#ffd700';
+    ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+  }
+
+  // ── 顶部 HUD ────────────────────────────────────────────────
+  _drawHUD() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.fillRect(GRID_X, 0, CANVAS_W - GRID_X, HUD_H);
+
+    const min = String(Math.floor(this.gameTime/60)).padStart(2,'0');
+    const sec = String(Math.floor(this.gameTime%60)).padStart(2,'0');
+    ctx.fillStyle = '#e0e0e0'; ctx.font = '15px monospace'; ctx.textAlign = 'left';
+    ctx.fillText(`⏱ ${min}:${sec}`, GRID_X+12, 32);
+
+    ctx.fillStyle = 'rgba(255,255,255,0.3)'; ctx.font = '13px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('波次进度  (阶段3实现)', GRID_X+310, 30);
+
+    // 静音提示
+    ctx.fillStyle = 'rgba(255,255,255,0.28)'; ctx.font = '11px Arial'; ctx.textAlign = 'right';
+    ctx.fillText(this.sound.muted ? '🔇 M' : '🔊 M', CANVAS_W - 90, 32);
+
+    this._drawPauseButton();
+  }
+
+  _drawPauseButton() {
+    const ctx = this.ctx, btn = this.ui.pauseBtn, hov = this._isHovered(btn);
+    ctx.fillStyle = hov ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.14)';
+    ctx.beginPath(); ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 5); ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 13px Arial'; ctx.textAlign = 'center';
+    ctx.fillText(this.state === GameState.PAUSED ? '▶ 继续' : '⏸ 暂停', btn.x+btn.w/2, btn.y+btn.h/2+5);
+  }
+
+  // ── 暂停遮罩 ────────────────────────────────────────────────
+  _drawPauseOverlay() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.58)'; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.save();
+    ctx.shadowColor = '#00ff88'; ctx.shadowBlur = 25;
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 70px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('⏸ 游戏暂停', CANVAS_W/2, CANVAS_H/2 - 15);
+    ctx.restore();
+    ctx.fillStyle = 'rgba(255,255,255,0.65)'; ctx.font = '20px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('按 P 键 或 点击右上角按钮继续', CANVAS_W/2, CANVAS_H/2 + 45);
+  }
+
+  _drawWinScreen() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+    ctx.fillStyle = '#ffd700'; ctx.font = 'bold 72px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('🎉 你赢了!', CANVAS_W/2, CANVAS_H/2 - 20);
+    ctx.fillStyle = '#ffffff'; ctx.font = '22px Arial';
+    ctx.fillText('按 R 键重新开始', CANVAS_W/2, CANVAS_H/2 + 45);
+  }
+
+  _drawLoseScreen() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(80,0,0,0.6)'; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+    ctx.fillStyle = '#ff4444'; ctx.font = 'bold 54px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('🧟 僵尸吃了你的脑子!', CANVAS_W/2, CANVAS_H/2 - 20);
+    ctx.fillStyle = '#ffffff'; ctx.font = '22px Arial';
+    ctx.fillText('按 R 键重新开始', CANVAS_W/2, CANVAS_H/2 + 45);
+  }
+
+  _drawFPS() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)'; ctx.fillRect(CANVAS_W-80, CANVAS_H-30, 76, 24);
+    ctx.fillStyle = this.fps >= 50 ? '#00ff88' : this.fps >= 30 ? '#ffaa00' : '#ff4444';
+    ctx.font = '13px monospace'; ctx.textAlign = 'right';
+    ctx.fillText(`FPS: ${this.fps}`, CANVAS_W-6, CANVAS_H-11);
+  }
+
+  // ── 开始菜单 ────────────────────────────────────────────────
+  _drawMenu() {
+    const ctx = this.ctx, t = this.menuTimer;
+    const bg = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+    bg.addColorStop(0, '#7ec8e3'); bg.addColorStop(0.55, '#a8d8ea');
+    bg.addColorStop(0.55, '#5a8f3c'); bg.addColorStop(1, '#3a6020');
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    this._cloud(ctx, 100+Math.sin(t*0.2)*8, 75, 70);
+    this._cloud(ctx, 680+Math.sin(t*0.15)*6, 55, 90);
+    this._cloud(ctx, 430+Math.sin(t*0.25)*5, 110, 55);
+
+    ctx.save();
+    ctx.shadowColor = 'rgba(0,0,0,0.55)'; ctx.shadowBlur = 10;
+    ctx.shadowOffsetX = 4; ctx.shadowOffsetY = 4;
+    ctx.font = 'bold 68px Arial'; ctx.textAlign = 'center';
+    ctx.strokeStyle = '#1a4a08'; ctx.lineWidth = 7;
+    ctx.strokeText('植物大战僵尸', CANVAS_W/2, 185);
+    const tg = ctx.createLinearGradient(0, 120, 0, 200);
+    tg.addColorStop(0, '#ffffff'); tg.addColorStop(0.45, '#d4ff80'); tg.addColorStop(1, '#7ac943');
+    ctx.fillStyle = tg; ctx.fillText('植物大战僵尸', CANVAS_W/2, 185);
+    ctx.restore();
+
+    ctx.fillStyle = '#1a3a08'; ctx.font = '20px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('Plants vs. Zombies  ·  网页版', CANVAS_W/2, 222);
+
+    this._menuSunflower(ctx, 145, 365, t);
+    this._menuSunflower(ctx, 755, 365, t * 0.8);
+    this._menuZombie(ctx, 380, 470, t);
+    this._menuZombie(ctx, 540, 460, t * 1.2);
+    this._drawStartButton(ctx);
+
+    ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.font = '14px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('Enter / 点击开始  ·  P 暂停  ·  F FPS  ·  M 静音  ·  Esc 取消种植', CANVAS_W/2, 445);
+  }
+
+  _drawStartButton(ctx) {
+    const btn = this.ui.startBtn, hov = this._isHovered(btn);
+    const cx = btn.x+btn.w/2, cy = btn.y+btn.h/2;
+    ctx.save();
+    ctx.translate(cx, cy); ctx.scale(hov ? 1.04 : 1, hov ? 1.04 : 1); ctx.translate(-cx, -cy);
+    ctx.shadowColor = 'rgba(0,0,0,0.4)'; ctx.shadowBlur = 12; ctx.shadowOffsetY = 5;
+    const bg = ctx.createLinearGradient(btn.x, btn.y, btn.x, btn.y+btn.h);
+    hov ? (bg.addColorStop(0,'#9ede50'), bg.addColorStop(1,'#5eb020'))
+        : (bg.addColorStop(0,'#82cc35'), bg.addColorStop(1,'#4a9010'));
+    ctx.fillStyle = bg; ctx.beginPath(); ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 14); ctx.fill();
+    ctx.restore();
+    ctx.strokeStyle = '#2d5a10'; ctx.lineWidth = 2.5;
+    ctx.beginPath(); ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 14); ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.font = 'bold 24px Arial'; ctx.textAlign = 'center';
+    ctx.fillText('🌻  开始游戏', cx, cy + 9);
+  }
+
+  _cloud(ctx, x, y, s) {
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    ctx.beginPath();
+    ctx.arc(x, y, s*.50, 0, Math.PI*2); ctx.arc(x+s*.40, y-s*.08, s*.36, 0, Math.PI*2);
+    ctx.arc(x-s*.32, y+s*.05, s*.30, 0, Math.PI*2); ctx.arc(x+s*.68, y+s*.10, s*.27, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  _menuSunflower(ctx, x, y, t) {
+    const sway = Math.sin(t*1.2)*0.06;
+    ctx.save();
+    ctx.translate(x, y+40); ctx.rotate(sway); ctx.translate(-x, -(y+40));
+    ctx.strokeStyle = '#4a8a20'; ctx.lineWidth = 5;
+    ctx.beginPath(); ctx.moveTo(x, y+40); ctx.lineTo(x, y); ctx.stroke();
+    ctx.fillStyle = '#ffd700';
+    for (let i = 0; i < 8; i++) {
+      const a = (i/8)*Math.PI*2 + t*0.5;
+      ctx.save(); ctx.translate(x+Math.cos(a)*22, y+Math.sin(a)*22); ctx.rotate(a);
+      ctx.beginPath(); ctx.ellipse(0,0,7,14,0,0,Math.PI*2); ctx.fill(); ctx.restore();
+    }
+    ctx.fillStyle = '#7a3c10'; ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#2d1500';
+    ctx.beginPath(); ctx.arc(x-5,y-3,2.5,0,Math.PI*2); ctx.arc(x+5,y-3,2.5,0,Math.PI*2); ctx.fill();
+    ctx.strokeStyle = '#2d1500'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, y+2, 5, 0.2, Math.PI-0.2); ctx.stroke();
+    ctx.restore();
+  }
+
+  _menuZombie(ctx, x, y, t) {
+    const bob = Math.sin(t*3)*3, leg = Math.sin(t*3)*12;
+    ctx.save(); ctx.translate(0, bob);
+    ctx.strokeStyle = '#7a8f7a'; ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(x-6, y); ctx.lineTo(x-6+leg, y+30); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(x+6, y); ctx.lineTo(x+6-leg, y+30); ctx.stroke();
+    ctx.fillStyle = '#7a8f7a'; ctx.fillRect(x-13, y-35, 26, 36);
+    ctx.fillStyle = '#9aaf98'; ctx.beginPath(); ctx.arc(x, y-50, 19, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath(); ctx.arc(x-7,y-53,5,0,Math.PI*2); ctx.arc(x+7,y-53,5,0,Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#333';
+    ctx.beginPath(); ctx.arc(x-6,y-53,2.5,0,Math.PI*2); ctx.arc(x+8,y-53,2.5,0,Math.PI*2); ctx.fill();
+    const arm = Math.sin(t*3)*6;
+    ctx.strokeStyle = '#7a8f7a'; ctx.lineWidth = 7;
+    ctx.beginPath(); ctx.moveTo(x+13, y-22); ctx.lineTo(x+40, y-12+arm); ctx.stroke();
+    ctx.restore();
+  }
+
+  _isHovered(btn) {
+    return this.mouse.x >= btn.x && this.mouse.x <= btn.x+btn.w &&
+           this.mouse.y >= btn.y && this.mouse.y <= btn.y+btn.h;
+  }
+
+  _updateCursor() {
+    let pointer = false;
+    if (this.state === GameState.MENU && this._isHovered(this.ui.startBtn)) pointer = true;
+    if ((this.state === GameState.PLAYING || this.state === GameState.PAUSED) && this._isHovered(this.ui.pauseBtn)) pointer = true;
+    if (this.state === GameState.PLAYING) {
+      if (this.sunManager) for (const s of this.sunManager.suns) if (s.hovered) { pointer = true; break; }
+      for (let i = 0; i < this.seedPackets.length; i++) {
+        const r = this._cardRect(i);
+        if (this.mouse.x >= r.x && this.mouse.x <= r.x+r.w &&
+            this.mouse.y >= r.y && this.mouse.y <= r.y+r.h &&
+            this.seedPackets[i].canAfford(this.sun)) { pointer = true; break; }
+      }
+      if (this.selectedCard >= 0 && this.grid.hoverCell) pointer = true;
+    }
+    this.canvas.style.cursor = pointer ? 'pointer' : 'default';
+  }
+}
+
+// ================================================================
+// 启动
+// ================================================================
+const game = new Game();
+game.start();
+</script>
+</body>
+</html>

@@ -1,0 +1,792 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>植物大战僵尸</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }
+    canvas {
+      display: block;
+      border: 3px solid #4a7c59;
+      box-shadow: 0 0 40px rgba(74, 124, 89, 0.6);
+    }
+  </style>
+</head>
+<body>
+<canvas id="gameCanvas" width="900" height="600"></canvas>
+
+<script>
+'use strict';
+
+// ================================================================
+// 全局常量 (Global Constants)
+// ================================================================
+const CANVAS_W      = 900;   // 画布宽度
+const CANVAS_H      = 600;   // 画布高度
+const GRID_COLS     = 9;     // 网格列数
+const GRID_ROWS     = 5;     // 网格行数
+const CELL_W        = 80;    // 每格宽度（像素）
+const CELL_H        = 100;   // 每格高度（像素）
+const CARD_BAR_W    = 120;   // 左侧种植栏宽度
+const HUD_H         = 50;    // 顶部 HUD 高度
+// 网格区域起始坐标
+const GRID_X        = CARD_BAR_W;                   // 120
+const GRID_Y        = HUD_H;                         // 50
+
+// ================================================================
+// GameState 枚举 (State Enum)
+// ================================================================
+const GameState = Object.freeze({
+  MENU:    'MENU',
+  PLAYING: 'PLAYING',
+  PAUSED:  'PAUSED',
+  WIN:     'WIN',
+  LOSE:    'LOSE',
+});
+
+// ================================================================
+// Grid 类 — 管理 5×9 网格坐标系
+// ================================================================
+class Grid {
+  constructor() {
+    // 交替草地颜色
+    this.colorLight = '#5a8f3c';
+    this.colorDark  = '#4a7a2e';
+    // 鼠标悬浮高亮的格子
+    this.hoverCell = null;
+  }
+
+  // 网格坐标 → 格子左上角像素坐标
+  toPixel(col, row) {
+    return {
+      x: GRID_X + col * CELL_W,
+      y: GRID_Y + row * CELL_H,
+    };
+  }
+
+  // 网格坐标 → 格子中心像素坐标
+  toCenterPixel(col, row) {
+    return {
+      x: GRID_X + col * CELL_W + CELL_W / 2,
+      y: GRID_Y + row * CELL_H + CELL_H / 2,
+    };
+  }
+
+  // 像素坐标 → 网格坐标（越界返回 null）
+  toCell(px, py) {
+    const col = Math.floor((px - GRID_X) / CELL_W);
+    const row = Math.floor((py - GRID_Y) / CELL_H);
+    if (col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS) {
+      return { col, row };
+    }
+    return null;
+  }
+
+  // 更新鼠标悬浮格子（供后续阶段调用）
+  updateHover(mx, my) {
+    this.hoverCell = this.toCell(mx, my);
+  }
+
+  // 绘制网格
+  draw(ctx) {
+    for (let row = 0; row < GRID_ROWS; row++) {
+      for (let col = 0; col < GRID_COLS; col++) {
+        const isLight = (row + col) % 2 === 0;
+        const { x, y } = this.toPixel(col, row);
+
+        // 基础草地颜色
+        ctx.fillStyle = isLight ? this.colorLight : this.colorDark;
+        ctx.fillRect(x, y, CELL_W, CELL_H);
+
+        // 悬浮高亮（供阶段2种植交互用）
+        if (this.hoverCell &&
+            this.hoverCell.col === col &&
+            this.hoverCell.row === row) {
+          ctx.fillStyle = 'rgba(255, 255, 255, 0.18)';
+          ctx.fillRect(x, y, CELL_W, CELL_H);
+        }
+      }
+    }
+
+    // 网格外框
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';
+    ctx.lineWidth = 0.5;
+    // 横线
+    for (let row = 0; row <= GRID_ROWS; row++) {
+      ctx.beginPath();
+      ctx.moveTo(GRID_X, GRID_Y + row * CELL_H);
+      ctx.lineTo(GRID_X + GRID_COLS * CELL_W, GRID_Y + row * CELL_H);
+      ctx.stroke();
+    }
+    // 竖线
+    for (let col = 0; col <= GRID_COLS; col++) {
+      ctx.beginPath();
+      ctx.moveTo(GRID_X + col * CELL_W, GRID_Y);
+      ctx.lineTo(GRID_X + col * CELL_W, GRID_Y + GRID_ROWS * CELL_H);
+      ctx.stroke();
+    }
+  }
+}
+
+// ================================================================
+// Game 类 — 全局状态 + 游戏循环
+// ================================================================
+class Game {
+  constructor() {
+    this.canvas = document.getElementById('gameCanvas');
+    this.ctx    = this.canvas.getContext('2d');
+
+    // 游戏状态
+    this.state = GameState.MENU;
+
+    // 子系统
+    this.grid = new Grid();
+
+    // 时间
+    this.lastTimestamp = 0;   // 上一帧时间戳（毫秒）
+    this.deltaTime     = 0;   // 当前帧间隔（秒）
+    this.gameTime      = 0;   // 游戏内已运行时间（秒，暂停不计）
+
+    // FPS
+    this.fps         = 0;
+    this._fpsFrames  = 0;
+    this._fpsAccum   = 0;
+    this.showFPS     = true;  // F 键切换
+
+    // 鼠标
+    this.mouse = { x: 0, y: 0 };
+
+    // 菜单动画计时器（用于装饰物动画）
+    this.menuTimer = 0;
+
+    // UI 区域定义（方便统一检测点击）
+    this.ui = {
+      startBtn: { x: 325, y: 310, w: 250, h: 65 },
+      pauseBtn: { x: 816, y: 8,   w: 76,  h: 34 },
+    };
+
+    this._bindEvents();
+  }
+
+  // ── 事件绑定 ────────────────────────────────────────────────
+  _bindEvents() {
+    const canvas = this.canvas;
+
+    // 鼠标移动 — 换算为画布内坐标（支持 CSS 缩放）
+    canvas.addEventListener('mousemove', (e) => {
+      const r = canvas.getBoundingClientRect();
+      this.mouse.x = (e.clientX - r.left) * (CANVAS_W / r.width);
+      this.mouse.y = (e.clientY - r.top)  * (CANVAS_H / r.height);
+      this.grid.updateHover(this.mouse.x, this.mouse.y);
+    });
+
+    // 点击
+    canvas.addEventListener('click', (e) => {
+      const r = canvas.getBoundingClientRect();
+      const mx = (e.clientX - r.left) * (CANVAS_W / r.width);
+      const my = (e.clientY - r.top)  * (CANVAS_H / r.height);
+      this._handleClick(mx, my);
+    });
+
+    // 键盘
+    document.addEventListener('keydown', (e) => this._handleKey(e.key));
+  }
+
+  // ── 点击分发 ────────────────────────────────────────────────
+  _handleClick(mx, my) {
+    const hit = (btn) =>
+      mx >= btn.x && mx <= btn.x + btn.w &&
+      my >= btn.y && my <= btn.y + btn.h;
+
+    switch (this.state) {
+      case GameState.MENU:
+        if (hit(this.ui.startBtn)) this._startGame();
+        break;
+      case GameState.PLAYING:
+        if (hit(this.ui.pauseBtn)) this._pause();
+        break;
+      case GameState.PAUSED:
+        if (hit(this.ui.pauseBtn)) this._resume();
+        break;
+    }
+  }
+
+  // ── 键盘分发 ────────────────────────────────────────────────
+  _handleKey(key) {
+    if (key === 'Enter' && this.state === GameState.MENU) {
+      this._startGame();
+    }
+    if ((key === 'p' || key === 'P')) {
+      if (this.state === GameState.PLAYING) this._pause();
+      else if (this.state === GameState.PAUSED) this._resume();
+    }
+    if (key === 'f' || key === 'F') {
+      this.showFPS = !this.showFPS;
+    }
+  }
+
+  // ── 状态切换 ────────────────────────────────────────────────
+  _startGame() {
+    this.state    = GameState.PLAYING;
+    this.gameTime = 0;
+  }
+
+  _pause() {
+    if (this.state === GameState.PLAYING) this.state = GameState.PAUSED;
+  }
+
+  _resume() {
+    if (this.state === GameState.PAUSED) this.state = GameState.PLAYING;
+  }
+
+  // ── 主循环入口 ───────────────────────────────────────────────
+  start() {
+    requestAnimationFrame((t) => this._loop(t));
+  }
+
+  _loop(timestamp) {
+    // 帧间隔（秒），限制最大值防止初始大跳帧
+    this.deltaTime     = Math.min((timestamp - this.lastTimestamp) / 1000, 0.1);
+    this.lastTimestamp = timestamp;
+
+    // FPS 统计
+    this._fpsFrames++;
+    this._fpsAccum += this.deltaTime;
+    if (this._fpsAccum >= 1.0) {
+      this.fps        = this._fpsFrames;
+      this._fpsFrames = 0;
+      this._fpsAccum -= 1.0;
+    }
+
+    this._update(this.deltaTime);
+    this._draw();
+
+    requestAnimationFrame((t) => this._loop(t));
+  }
+
+  // ── 更新逻辑 ────────────────────────────────────────────────
+  _update(dt) {
+    // 菜单动画始终运行
+    this.menuTimer += dt;
+
+    if (this.state === GameState.PLAYING) {
+      // 游戏内计时只在 PLAYING 时累加
+      this.gameTime += dt;
+      // 后续阶段在此调用子系统 update：
+      // this.sunManager.update(dt);
+      // this.plantManager.update(dt);
+      // this.zombieManager.update(dt);
+    }
+  }
+
+  // ── 总绘制入口 ───────────────────────────────────────────────
+  _draw() {
+    const ctx = this.ctx;
+    ctx.clearRect(0, 0, CANVAS_W, CANVAS_H);
+
+    switch (this.state) {
+      case GameState.MENU:
+        this._drawMenu();
+        break;
+      case GameState.PLAYING:
+        this._drawGameScene();
+        break;
+      case GameState.PAUSED:
+        this._drawGameScene();
+        this._drawPauseOverlay();
+        break;
+      case GameState.WIN:
+        this._drawGameScene();
+        this._drawWinScreen();
+        break;
+      case GameState.LOSE:
+        this._drawGameScene();
+        this._drawLoseScreen();
+        break;
+    }
+
+    if (this.showFPS && this.state !== GameState.MENU) {
+      this._drawFPS();
+    }
+
+    // 鼠标样式
+    this._updateCursor();
+  }
+
+  // ── 游戏主场景 ───────────────────────────────────────────────
+  _drawGameScene() {
+    const ctx = this.ctx;
+
+    // 天空（网格上方 + 右侧余白）
+    ctx.fillStyle = '#7ec8e3';
+    ctx.fillRect(GRID_X, 0, CANVAS_W - GRID_X, GRID_Y);
+    // 右侧余白（网格宽度 = 9×80 = 720，画布剩余 60px）
+    ctx.fillStyle = '#7ec8e3';
+    ctx.fillRect(GRID_X + GRID_COLS * CELL_W, GRID_Y,
+                 CANVAS_W - GRID_X - GRID_COLS * CELL_W, GRID_ROWS * CELL_H);
+    // 底部余白
+    ctx.fillStyle = '#4a7a2e';
+    ctx.fillRect(GRID_X, GRID_Y + GRID_ROWS * CELL_H,
+                 CANVAS_W - GRID_X, CANVAS_H - GRID_Y - GRID_ROWS * CELL_H);
+
+    // 网格草地
+    this.grid.draw(ctx);
+
+    // 左侧种植卡牌栏
+    this._drawCardBar();
+
+    // 顶部 HUD
+    this._drawHUD();
+  }
+
+  // ── 左侧种植卡牌栏 ──────────────────────────────────────────
+  _drawCardBar() {
+    const ctx = this.ctx;
+
+    // 背景
+    const grad = ctx.createLinearGradient(0, 0, CARD_BAR_W, 0);
+    grad.addColorStop(0, '#263d17');
+    grad.addColorStop(1, '#3a5c20');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, CARD_BAR_W, CANVAS_H);
+
+    // 右侧分隔线
+    ctx.strokeStyle = '#1a2e0a';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(CARD_BAR_W, 0);
+    ctx.lineTo(CARD_BAR_W, CANVAS_H);
+    ctx.stroke();
+
+    // 阳光显示框
+    ctx.fillStyle = '#1a2e0a';
+    ctx.beginPath();
+    ctx.roundRect(8, 8, CARD_BAR_W - 16, 44, 6);
+    ctx.fill();
+    ctx.strokeStyle = '#c8a800';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // 小太阳图标
+    this._drawMiniSun(ctx, 28, 30, 13);
+
+    // 阳光数值（占位 50，阶段2实现真实值）
+    ctx.fillStyle = '#ffd700';
+    ctx.font = 'bold 20px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText('50', 46, 37);
+
+    // 卡牌占位提示（阶段2会替换）
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.font = '11px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('植物卡牌', CARD_BAR_W / 2, 80);
+    ctx.fillText('(阶段2实现)', CARD_BAR_W / 2, 96);
+
+    // 绘制卡牌占位框
+    for (let i = 0; i < 4; i++) {
+      const cy = 115 + i * 110;
+      ctx.strokeStyle = 'rgba(255,255,255,0.2)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.roundRect(10, cy, CARD_BAR_W - 20, 95, 4);
+      ctx.stroke();
+      ctx.fillStyle = 'rgba(0,0,0,0.2)';
+      ctx.fill();
+    }
+  }
+
+  // ── 小太阳图标（通用辅助）───────────────────────────────────
+  _drawMiniSun(ctx, cx, cy, r) {
+    // 光芒
+    ctx.save();
+    ctx.strokeStyle = '#ffd700';
+    ctx.lineWidth = 1.5;
+    for (let i = 0; i < 8; i++) {
+      const a = (i / 8) * Math.PI * 2;
+      ctx.beginPath();
+      ctx.moveTo(cx + Math.cos(a) * (r + 1), cy + Math.sin(a) * (r + 1));
+      ctx.lineTo(cx + Math.cos(a) * (r + 5), cy + Math.sin(a) * (r + 5));
+      ctx.stroke();
+    }
+    // 圆形主体
+    ctx.fillStyle = '#ffd700';
+    ctx.beginPath();
+    ctx.arc(cx, cy, r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // ── 顶部 HUD ────────────────────────────────────────────────
+  _drawHUD() {
+    const ctx = this.ctx;
+
+    // HUD 背景
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillRect(GRID_X, 0, CANVAS_W - GRID_X, HUD_H);
+
+    // 游戏计时
+    const min = String(Math.floor(this.gameTime / 60)).padStart(2, '0');
+    const sec = String(Math.floor(this.gameTime % 60)).padStart(2, '0');
+    ctx.fillStyle = '#e0e0e0';
+    ctx.font = '15px monospace';
+    ctx.textAlign = 'left';
+    ctx.fillText(`⏱ ${min}:${sec}`, GRID_X + 12, 32);
+
+    // 波次进度占位（阶段3实现）
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.font = '13px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('波次进度  (阶段3实现)', GRID_X + 330, 30);
+
+    // 暂停按钮
+    this._drawPauseButton();
+  }
+
+  // ── 暂停/继续按钮 ────────────────────────────────────────────
+  _drawPauseButton() {
+    const ctx = this.ctx;
+    const btn = this.ui.pauseBtn;
+    const hovered = this._isHovered(btn);
+
+    ctx.fillStyle = hovered ? 'rgba(255,255,255,0.28)' : 'rgba(255,255,255,0.14)';
+    ctx.beginPath();
+    ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 5);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.55)';
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 13px Arial';
+    ctx.textAlign = 'center';
+    const label = this.state === GameState.PAUSED ? '▶ 继续' : '⏸ 暂停';
+    ctx.fillText(label, btn.x + btn.w / 2, btn.y + btn.h / 2 + 5);
+  }
+
+  // ── 暂停遮罩 ────────────────────────────────────────────────
+  _drawPauseOverlay() {
+    const ctx = this.ctx;
+
+    // 半透明黑色蒙版
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.58)';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // 主标题
+    ctx.save();
+    ctx.shadowColor = '#00ff88';
+    ctx.shadowBlur  = 25;
+    ctx.fillStyle   = '#ffffff';
+    ctx.font        = 'bold 70px Arial';
+    ctx.textAlign   = 'center';
+    ctx.fillText('⏸ 游戏暂停', CANVAS_W / 2, CANVAS_H / 2 - 15);
+    ctx.restore();
+
+    // 提示文字
+    ctx.fillStyle = 'rgba(255,255,255,0.65)';
+    ctx.font      = '20px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('按 P 键 或 点击右上角按钮继续', CANVAS_W / 2, CANVAS_H / 2 + 45);
+  }
+
+  // ── 开始菜单 ─────────────────────────────────────────────────
+  _drawMenu() {
+    const ctx = this.ctx;
+    const t   = this.menuTimer;
+
+    // 背景（天空渐变 → 草地）
+    const bg = ctx.createLinearGradient(0, 0, 0, CANVAS_H);
+    bg.addColorStop(0,   '#7ec8e3');
+    bg.addColorStop(0.55,'#a8d8ea');
+    bg.addColorStop(0.55,'#5a8f3c');
+    bg.addColorStop(1,   '#3a6020');
+    ctx.fillStyle = bg;
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+
+    // 装饰云朵
+    this._drawCloud(ctx, 100 + Math.sin(t * 0.2) * 8,  75, 70);
+    this._drawCloud(ctx, 680 + Math.sin(t * 0.15) * 6, 55, 90);
+    this._drawCloud(ctx, 430 + Math.sin(t * 0.25) * 5, 110, 55);
+
+    // 游戏标题
+    ctx.save();
+    ctx.shadowColor   = 'rgba(0,0,0,0.55)';
+    ctx.shadowBlur    = 10;
+    ctx.shadowOffsetX = 4;
+    ctx.shadowOffsetY = 4;
+    ctx.font          = 'bold 68px Arial';
+    ctx.textAlign     = 'center';
+    // 描边
+    ctx.strokeStyle = '#1a4a08';
+    ctx.lineWidth   = 7;
+    ctx.strokeText('植物大战僵尸', CANVAS_W / 2, 185);
+    // 渐变填充
+    const tg = ctx.createLinearGradient(0, 120, 0, 200);
+    tg.addColorStop(0, '#ffffff');
+    tg.addColorStop(0.45, '#d4ff80');
+    tg.addColorStop(1, '#7ac943');
+    ctx.fillStyle = tg;
+    ctx.fillText('植物大战僵尸', CANVAS_W / 2, 185);
+    ctx.restore();
+
+    // 副标题
+    ctx.fillStyle = '#1a3a08';
+    ctx.font      = '20px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Plants vs. Zombies  ·  网页版', CANVAS_W / 2, 222);
+
+    // 装饰植物 & 僵尸
+    this._drawMenuSunflower(ctx, 145, 365, t);
+    this._drawMenuSunflower(ctx, 755, 365, t * 0.8);
+    this._drawMenuZombie(ctx, 380, 470, t);
+    this._drawMenuZombie(ctx, 540, 460, t * 1.2);
+
+    // 开始按钮
+    this._drawStartButton(ctx);
+
+    // 操作说明
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.font      = '14px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('点击按钮或按 Enter 开始  ·  P 暂停  ·  F 切换FPS', CANVAS_W / 2, 445);
+  }
+
+  // ── 开始按钮 ─────────────────────────────────────────────────
+  _drawStartButton(ctx) {
+    const btn     = this.ui.startBtn;
+    const hovered = this._isHovered(btn);
+    const scale   = hovered ? 1.04 : 1.0;
+    const cx      = btn.x + btn.w / 2;
+    const cy      = btn.y + btn.h / 2;
+
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.scale(scale, scale);
+    ctx.translate(-cx, -cy);
+
+    // 阴影
+    ctx.shadowColor  = 'rgba(0,0,0,0.4)';
+    ctx.shadowBlur   = 12;
+    ctx.shadowOffsetY = 5;
+
+    const bg = ctx.createLinearGradient(btn.x, btn.y, btn.x, btn.y + btn.h);
+    if (hovered) {
+      bg.addColorStop(0, '#9ede50');
+      bg.addColorStop(1, '#5eb020');
+    } else {
+      bg.addColorStop(0, '#82cc35');
+      bg.addColorStop(1, '#4a9010');
+    }
+    ctx.fillStyle = bg;
+    ctx.beginPath();
+    ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 14);
+    ctx.fill();
+    ctx.restore();
+
+    ctx.strokeStyle = '#2d5a10';
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath();
+    ctx.roundRect(btn.x, btn.y, btn.w, btn.h, 14);
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font      = 'bold 24px Arial';
+    ctx.textAlign = 'center';
+    ctx.shadowColor = 'rgba(0,0,0,0.35)';
+    ctx.shadowBlur  = 4;
+    ctx.fillText('🌻  开始游戏', cx, cy + 9);
+    ctx.shadowBlur  = 0;
+  }
+
+  // ── 胜利画面（阶段3后触发，先搭好架子）───────────────────────
+  _drawWinScreen() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.fillStyle = '#ffd700';
+    ctx.font      = 'bold 72px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('🎉 你赢了!', CANVAS_W / 2, CANVAS_H / 2 - 20);
+    ctx.fillStyle = '#ffffff';
+    ctx.font      = '22px Arial';
+    ctx.fillText('按 R 键重新开始', CANVAS_W / 2, CANVAS_H / 2 + 45);
+  }
+
+  // ── 失败画面（阶段3后触发，先搭好架子）───────────────────────
+  _drawLoseScreen() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(80, 0, 0, 0.6)';
+    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
+    ctx.fillStyle = '#ff4444';
+    ctx.font      = 'bold 56px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('🧟 僵尸吃了你的脑子!', CANVAS_W / 2, CANVAS_H / 2 - 20);
+    ctx.fillStyle = '#ffffff';
+    ctx.font      = '22px Arial';
+    ctx.fillText('按 R 键重新开始', CANVAS_W / 2, CANVAS_H / 2 + 45);
+  }
+
+  // ── FPS 显示 ─────────────────────────────────────────────────
+  _drawFPS() {
+    const ctx = this.ctx;
+    ctx.fillStyle = 'rgba(0,0,0,0.5)';
+    ctx.fillRect(CANVAS_W - 80, CANVAS_H - 30, 76, 24);
+    ctx.fillStyle = this.fps >= 50 ? '#00ff88' : this.fps >= 30 ? '#ffaa00' : '#ff4444';
+    ctx.font      = '13px monospace';
+    ctx.textAlign = 'right';
+    ctx.fillText(`FPS: ${this.fps}`, CANVAS_W - 6, CANVAS_H - 11);
+  }
+
+  // ── 菜单装饰：云朵 ──────────────────────────────────────────
+  _drawCloud(ctx, x, y, size) {
+    ctx.fillStyle = 'rgba(255,255,255,0.88)';
+    ctx.beginPath();
+    ctx.arc(x,              y,              size * 0.50, 0, Math.PI * 2);
+    ctx.arc(x + size * 0.40, y - size * 0.08, size * 0.36, 0, Math.PI * 2);
+    ctx.arc(x - size * 0.32, y + size * 0.05, size * 0.30, 0, Math.PI * 2);
+    ctx.arc(x + size * 0.68, y + size * 0.10, size * 0.27, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  // ── 菜单装饰：向日葵 ────────────────────────────────────────
+  _drawMenuSunflower(ctx, x, y, t) {
+    // 摇摆角（正弦波）
+    const sway = Math.sin(t * 1.2) * 0.06;
+
+    ctx.save();
+    ctx.translate(x, y + 40);
+    ctx.rotate(sway);
+    ctx.translate(-x, -(y + 40));
+
+    // 茎
+    ctx.strokeStyle = '#4a8a20';
+    ctx.lineWidth   = 5;
+    ctx.beginPath();
+    ctx.moveTo(x, y + 40);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+
+    // 花瓣（8片椭圆）
+    ctx.fillStyle = '#ffd700';
+    for (let i = 0; i < 8; i++) {
+      const a  = (i / 8) * Math.PI * 2 + t * 0.5;
+      const px = x + Math.cos(a) * 22;
+      const py = y + Math.sin(a) * 22;
+      ctx.save();
+      ctx.translate(px, py);
+      ctx.rotate(a);
+      ctx.beginPath();
+      ctx.ellipse(0, 0, 7, 14, 0, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 花盘
+    ctx.fillStyle = '#7a3c10';
+    ctx.beginPath();
+    ctx.arc(x, y, 16, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 眼睛
+    ctx.fillStyle = '#2d1500';
+    ctx.beginPath();
+    ctx.arc(x - 5, y - 3, 2.5, 0, Math.PI * 2);
+    ctx.arc(x + 5, y - 3, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 嘴巴（微笑）
+    ctx.strokeStyle = '#2d1500';
+    ctx.lineWidth   = 2;
+    ctx.beginPath();
+    ctx.arc(x, y + 2, 5, 0.2, Math.PI - 0.2);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // ── 菜单装饰：僵尸 ──────────────────────────────────────────
+  _drawMenuZombie(ctx, x, y, t) {
+    // 走路晃动
+    const bob = Math.sin(t * 3) * 3;
+
+    ctx.save();
+    ctx.translate(0, bob);
+
+    // 腿部
+    const legSwing = Math.sin(t * 3) * 12;
+    ctx.strokeStyle = '#7a8f7a';
+    ctx.lineWidth   = 7;
+    ctx.beginPath();
+    ctx.moveTo(x - 6, y);
+    ctx.lineTo(x - 6 + legSwing, y + 30);
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(x + 6, y);
+    ctx.lineTo(x + 6 - legSwing, y + 30);
+    ctx.stroke();
+
+    // 身体
+    ctx.fillStyle = '#7a8f7a';
+    ctx.fillRect(x - 13, y - 35, 26, 36);
+
+    // 头
+    ctx.fillStyle = '#9aaf98';
+    ctx.beginPath();
+    ctx.arc(x, y - 50, 19, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 眼睛（呆滞）
+    ctx.fillStyle = '#ffffff';
+    ctx.beginPath();
+    ctx.arc(x - 7, y - 53, 5, 0, Math.PI * 2);
+    ctx.arc(x + 7, y - 53, 5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(x - 6, y - 53, 2.5, 0, Math.PI * 2);
+    ctx.arc(x + 8, y - 53, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 前伸手臂
+    const armSwing = Math.sin(t * 3) * 6;
+    ctx.strokeStyle = '#7a8f7a';
+    ctx.lineWidth   = 7;
+    ctx.beginPath();
+    ctx.moveTo(x + 13, y - 22);
+    ctx.lineTo(x + 40, y - 12 + armSwing);
+    ctx.stroke();
+
+    ctx.restore();
+  }
+
+  // ── 工具：判断鼠标是否悬浮在矩形按钮上 ─────────────────────
+  _isHovered(btn) {
+    return this.mouse.x >= btn.x && this.mouse.x <= btn.x + btn.w &&
+           this.mouse.y >= btn.y && this.mouse.y <= btn.y + btn.h;
+  }
+
+  // ── 更新鼠标样式 ─────────────────────────────────────────────
+  _updateCursor() {
+    const hoverStart  = this.state === GameState.MENU   && this._isHovered(this.ui.startBtn);
+    const hoverPause  = (this.state === GameState.PLAYING || this.state === GameState.PAUSED)
+                        && this._isHovered(this.ui.pauseBtn);
+    this.canvas.style.cursor = (hoverStart || hoverPause) ? 'pointer' : 'default';
+  }
+}
+
+// ================================================================
+// 启动
+// ================================================================
+const game = new Game();
+game.start();
+</script>
+</body>
+</html>

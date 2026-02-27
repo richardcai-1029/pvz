@@ -181,6 +181,30 @@ class SoundManager {
       });
     });
   }
+
+  playMower() {
+    this._play((ctx, out) => {
+      // 发动机轰鸣：锯齿波 + 白噪声混合
+      const len = Math.floor(ctx.sampleRate * 0.45);
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d   = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = (Math.random()*2-1) * 0.3 * (1 - i/len * 0.5);
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const lp  = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 500;
+      const g   = ctx.createGain(); g.gain.value = 0.35;
+      src.connect(lp); lp.connect(g); g.connect(out);
+      src.start(); src.stop(ctx.currentTime + 0.45);
+      // 马达音调
+      const osc = ctx.createOscillator(), g2 = ctx.createGain();
+      osc.type = 'sawtooth'; osc.frequency.setValueAtTime(80, ctx.currentTime);
+      osc.frequency.linearRampToValueAtTime(140, ctx.currentTime + 0.08);
+      osc.frequency.linearRampToValueAtTime(100, ctx.currentTime + 0.4);
+      g2.gain.setValueAtTime(0.22, ctx.currentTime);
+      g2.gain.linearRampToValueAtTime(0, ctx.currentTime + 0.45);
+      osc.connect(g2); g2.connect(out);
+      osc.start(ctx.currentTime); osc.stop(ctx.currentTime + 0.45);
+    });
+  }
 }
 
 // ================================================================
@@ -239,7 +263,7 @@ class Sun {
     this.maxIdle  = 8;        // 8秒后消失
     this.dead = false; this.collected = false;
     this.state = fromPlant ? 'idle' : 'falling';
-    this.fallSpeed = 45;      // px/s
+    this.fallSpeed = 110;     // px/s
     this.hovered = false;
     this.scale = 1;
     // 贝塞尔飞行动画参数
@@ -939,6 +963,139 @@ class Grid {
 }
 
 // ================================================================
+// ================================================================
+// Lawnmower — 每行左侧铲车（最后防线）
+// ================================================================
+class Lawnmower {
+  constructor(row) {
+    this.row    = row;
+    this.x      = GRID_X + 15;         // 铲车静止位置（第一列左侧，格子内可见）
+    this.y      = GRID_Y + row * CELL_H + CELL_H / 2;
+    this.active = false;  // false=静止等待，true=冲锋中
+    this.dead   = false;  // 冲出屏幕后消失
+    this.speed  = 420;    // 冲锋速度 px/s
+    this.bobTime = 0;     // 待机摆动计时
+  }
+
+  activate() {
+    if (!this.active && !this.dead) this.active = true;
+  }
+
+  update(dt) {
+    this.bobTime += dt;
+    if (this.active) {
+      this.x += this.speed * dt;
+      if (this.x > CANVAS_W + 60) this.dead = true;
+    }
+  }
+
+  // 返回当前碰撞 x 范围（宽 36px）
+  get hitLeft()  { return this.x - 18; }
+  get hitRight() { return this.x + 18; }
+
+  draw(ctx) {
+    if (this.dead) return;
+    ctx.save();
+
+    const bob = this.active ? 0 : Math.sin(this.bobTime * 1.8) * 2;
+
+    // 车身（黄绿色矩形）
+    ctx.fillStyle = '#c8d820';
+    ctx.beginPath();
+    ctx.roundRect(this.x - 20, this.y - 16 + bob, 38, 26, 5);
+    ctx.fill();
+    ctx.strokeStyle = '#6a8010'; ctx.lineWidth = 2; ctx.stroke();
+
+    // 刀片（旋转扇形）
+    ctx.save();
+    ctx.translate(this.x + 22, this.y + 6 + bob);
+    if (this.active) ctx.rotate(this.bobTime * 18);
+    ctx.fillStyle = '#e0e0e0';
+    for (let i = 0; i < 3; i++) {
+      ctx.rotate((Math.PI * 2) / 3);
+      ctx.beginPath();
+      ctx.ellipse(6, 0, 9, 4, 0, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
+
+    // 车轮
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(this.x - 10, this.y + 11 + bob, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.arc(this.x + 14, this.y + 11 + bob, 6, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#888';
+    ctx.beginPath();
+    ctx.arc(this.x - 10, this.y + 11 + bob, 3, 0, Math.PI * 2); ctx.fill();
+    ctx.beginPath();
+    ctx.arc(this.x + 14, this.y + 11 + bob, 3, 0, Math.PI * 2); ctx.fill();
+
+    // 警示灯（冲锋时闪烁）
+    if (this.active) {
+      ctx.fillStyle = Math.floor(this.bobTime * 8) % 2 === 0 ? '#ff4400' : '#ff8800';
+      ctx.beginPath();
+      ctx.arc(this.x - 8, this.y - 20 + bob, 5, 0, Math.PI * 2); ctx.fill();
+    }
+
+    ctx.restore();
+  }
+}
+
+// ================================================================
+// LawnmowerManager — 管理5行铲车
+// ================================================================
+class LawnmowerManager {
+  constructor(game) {
+    this.game   = game;
+    this.mowers = Array.from({ length: GRID_ROWS }, (_, r) => new Lawnmower(r));
+  }
+
+  // 某行铲车是否还在（未激活也未死亡）
+  rowHasMower(row) {
+    const m = this.mowers[row];
+    return m && !m.dead;
+  }
+
+  // 激活某行铲车，返回 true 表示成功激活（否则该行已无铲车）
+  triggerRow(row) {
+    const m = this.mowers[row];
+    if (!m || m.dead) return false;
+    if (!m.active) {
+      m.activate();
+      this.game.sound.playMower();
+      this.game.particles.burst(m.x, m.y, 10, '#c8d820', 80, 0.4, 4);
+    }
+    return true;
+  }
+
+  update(dt) {
+    for (const m of this.mowers) {
+      if (m.dead) continue;
+      m.update(dt);
+      if (!m.active) continue;
+
+      // 铲车冲锋：碾压同行所有僵尸
+      const zm = this.game.zombieManager;
+      if (!zm) continue;
+      for (const z of zm.zombies) {
+        if (z.row !== m.row) continue;
+        if (z.dead || z.state === ZombieState.DYING || z.state === ZombieState.DEAD) continue;
+        if (z.x >= m.hitLeft && z.x <= m.hitRight + 40) {
+          z.health = 0;
+          z.state  = ZombieState.DYING;
+          z.dying  = true;
+          this.game.particles.burst(z.x, z.y - 40, 8, '#cc4400', 70, 0.4, 4);
+        }
+      }
+    }
+  }
+
+  draw(ctx) {
+    for (const m of this.mowers) m.draw(ctx);
+  }
+}
+
 // ZombieState 枚举
 // ================================================================
 const ZombieState = Object.freeze({ WALKING: 'WALKING', EATING: 'EATING', DYING: 'DYING', DEAD: 'DEAD' });
@@ -1006,7 +1163,7 @@ class Zombie {
     }
     if (this.state === ZombieState.WALKING) {
       this.x -= this.effectiveSpeed * dt;
-      if (this.x < GRID_X - 30) return 'REACHED_LEFT';
+      if (this.x < GRID_X + 5) return 'REACHED_LEFT';
     }
     return null;
   }
@@ -1196,10 +1353,19 @@ class ZombieManager {
     for (const z of this.zombies) {
       const result = z.update(dt);
       if (result === 'REACHED_LEFT') {
-        this.game.state = GameState.LOSE;
-        this.game.sound.playLose();
-        this.game.screenShake(8, 0.6);
-        return;
+        const lm = this.game.lawnmowerManager;
+        if (lm && lm.rowHasMower(z.row)) {
+          // 铲车挡住了——激活铲车，僵尸立刻被碾压（设为dying）
+          lm.triggerRow(z.row);
+          z.health = 0; z.state = ZombieState.DYING; z.dying = true;
+        } else {
+          // 该行已无铲车，游戏结束
+          this.game.state = GameState.LOSE;
+          this.game.sound.playLose();
+          this.game.screenShake(8, 0.6);
+          return;
+        }
+        continue;
       }
 
       // 碰撞：僵尸进入某列时检测植物
@@ -1430,6 +1596,7 @@ class Game {
     this.plantManager      = null;
     this.particles         = null;
     this.zombieManager     = null;
+    this.lawnmowerManager  = null;
     this.projectileManager = null;
     this.waveManager       = null;
     this.seedPackets  = [];
@@ -1579,6 +1746,7 @@ class Game {
     this.sunManager        = new SunManager(this);
     this.plantManager      = new PlantManager(this);
     this.zombieManager     = new ZombieManager(this);
+    this.lawnmowerManager  = new LawnmowerManager(this);
     this.projectileManager = new ProjectileManager(this);
     this.waveManager       = new WaveManager(this, LEVEL_CONFIG);
     this.seedPackets  = [
@@ -1622,6 +1790,7 @@ class Game {
     this.sunManager.update(dt);
     this.plantManager.update(dt);
     this.zombieManager.update(dt);
+    this.lawnmowerManager.update(dt);
     this.projectileManager.update(dt);
     this.waveManager.update(dt);
     this.particles.update(dt);
@@ -1674,6 +1843,7 @@ class Game {
     ctx.fillRect(GRID_X, GRID_Y + GRID_ROWS*CELL_H, CANVAS_W - GRID_X, CANVAS_H - GRID_Y - GRID_ROWS*CELL_H);
 
     this.grid.draw(ctx, plantMode, this.plantManager);
+    if (this.lawnmowerManager)  this.lawnmowerManager.draw(ctx);
     if (this.plantManager)      this.plantManager.draw(ctx);
     if (this.zombieManager)     this.zombieManager.draw(ctx);
     if (this.projectileManager) this.projectileManager.draw(ctx);

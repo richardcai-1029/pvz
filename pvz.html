@@ -625,13 +625,13 @@ class WallNut extends Plant {
     ctx.beginPath(); ctx.ellipse(this.x, this.y, 28, 35, 0, 0, Math.PI * 2); ctx.fill();
 
     // 裂纹（第2段）
-    if (ratio <= 0.66 && this.hitFlash === 0) {
+    if (ratio <= 0.66 && this.hitFlash <= 0) {
       ctx.strokeStyle = 'rgba(0,0,0,0.5)'; ctx.lineWidth = 2;
       ctx.beginPath(); ctx.moveTo(this.x - 8, this.y - 20);
       ctx.lineTo(this.x - 4, this.y - 6); ctx.lineTo(this.x - 11, this.y + 6); ctx.stroke();
     }
     // 更多裂纹（第3段）
-    if (ratio <= 0.33 && this.hitFlash === 0) {
+    if (ratio <= 0.33 && this.hitFlash <= 0) {
       ctx.beginPath(); ctx.moveTo(this.x + 6, this.y - 16);
       ctx.lineTo(this.x + 11, this.y - 1); ctx.lineTo(this.x + 4, this.y + 13); ctx.stroke();
       ctx.beginPath(); ctx.moveTo(this.x - 2, this.y + 10);
@@ -2008,6 +2008,20 @@ class Game {
         ctx.beginPath(); ctx.arc(cx+10, cy+4, 12, 0, Math.PI*2); ctx.fill();
         ctx.strokeStyle = '#3a6010'; ctx.lineWidth = 2;
         ctx.beginPath(); ctx.moveTo(cx-10, cy-8); ctx.quadraticCurveTo(cx, cy-20, cx+10, cy-8); ctx.stroke();
+        break;
+      case 'snowpea':
+        ctx.fillStyle = '#1a5a3a';
+        ctx.fillRect(cx - 6, cy + 2, 12, 18);
+        ctx.fillStyle = '#60c8e0';
+        ctx.beginPath(); ctx.arc(cx, cy - 4, 16, 0, Math.PI*2); ctx.fill();
+        ctx.strokeStyle = 'rgba(180,240,255,0.6)'; ctx.lineWidth = 1.5;
+        for (let i = 0; i < 6; i++) {
+          const a = (i/6)*Math.PI*2;
+          ctx.beginPath(); ctx.moveTo(cx, cy-4);
+          ctx.lineTo(cx+Math.cos(a)*11, cy-4+Math.sin(a)*11); ctx.stroke();
+        }
+        ctx.fillStyle = '#2890a8';
+        ctx.fillRect(cx+10, cy-8, 12, 6);
         break;
     }
     ctx.restore();

@@ -89,6 +89,46 @@ class SoundManager {
   }
 
   toggleMute() { this.muted = !this.muted; }
+
+  // 豌豆射击：快速噗声（白噪声脉冲）
+  playShoot() {
+    this._play((ctx, out) => {
+      const len = Math.floor(ctx.sampleRate * 0.06);
+      const buf = ctx.createBuffer(1, len, ctx.sampleRate);
+      const d = buf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = (Math.random()*2-1) * (1 - i/len);
+      const src = ctx.createBufferSource(); src.buffer = buf;
+      const flt = ctx.createBiquadFilter(); flt.type = 'bandpass'; flt.frequency.value = 1600;
+      const g = ctx.createGain(); g.gain.value = 0.13;
+      src.connect(flt); flt.connect(g); g.connect(out);
+      src.start(); src.stop(ctx.currentTime + 0.06);
+    });
+  }
+
+  // 僵尸受伤：低沉钝击
+  playZombieHit() {
+    this._play((ctx, out) => {
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.connect(g); g.connect(out);
+      osc.type = 'square'; osc.frequency.value = 110;
+      const t = ctx.currentTime;
+      g.gain.setValueAtTime(0.16, t); g.gain.linearRampToValueAtTime(0, t + 0.1);
+      osc.start(t); osc.stop(t + 0.1);
+    });
+  }
+
+  // 僵尸死亡：下降滑音
+  playZombieDie() {
+    this._play((ctx, out) => {
+      const osc = ctx.createOscillator(), g = ctx.createGain();
+      osc.connect(g); g.connect(out);
+      osc.type = 'sawtooth';
+      const t = ctx.currentTime;
+      osc.frequency.setValueAtTime(280, t); osc.frequency.linearRampToValueAtTime(40, t + 0.35);
+      g.gain.setValueAtTime(0.2, t); g.gain.linearRampToValueAtTime(0, t + 0.35);
+      osc.start(t); osc.stop(t + 0.35);
+    });
+  }
 }
 
 // ================================================================
@@ -426,10 +466,27 @@ class Sunflower extends Plant {
 class Peashooter extends Plant {
   constructor(col, row) {
     super(col, row, 'peashooter', 300);
-    this.shootTimer = 0;
+    this.shootTimer   = 0;
+    this.shootInterval = 1.5;  // 每 1.5s 射一颗
+    this.shootAnim    = 0;     // 射击后仰动画计时
   }
 
-  update(dt) { super.update(dt); return false; }
+  update(dt) {
+    super.update(dt);
+    if (this.shootAnim > 0) this.shootAnim -= dt;
+    return false;
+  }
+
+  // 由 PlantManager 调用：检测到同行僵尸时累积计时，到期返回 true
+  tryShoot(dt) {
+    this.shootTimer += dt;
+    if (this.shootTimer >= this.shootInterval) {
+      this.shootTimer = 0;
+      this.shootAnim  = 0.18;
+      return true;
+    }
+    return false;
+  }
 
   draw(ctx) {
     const hasDying = this._beginDying(ctx);
@@ -446,8 +503,9 @@ class Peashooter extends Plant {
     ctx.save(); ctx.translate(this.x + 10, this.y + 10); ctx.rotate(0.5);
     ctx.beginPath(); ctx.ellipse(0, 0, 13, 5, 0, 0, Math.PI * 2); ctx.fill(); ctx.restore();
 
-    // 头部
-    ctx.fillStyle = this.hitFlash > 0 ? '#ffffff' : '#5aaa20';
+    // 头部（射击时略微发亮）
+    const headColor = this.hitFlash > 0 ? '#ffffff' : (this.shootAnim > 0 ? '#88dd30' : '#5aaa20');
+    ctx.fillStyle = headColor;
     ctx.beginPath(); ctx.arc(this.x, this.y - 7, 20, 0, Math.PI * 2); ctx.fill();
 
     // 眼睛
